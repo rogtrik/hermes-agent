@@ -247,3 +247,95 @@ def test_v0_21_19_row_shapes_go_to_their_own_endpoint_with_its_own_key(monkeypat
         assert [r['model'] for r in legacy.main_requests()] == ['legacy-model']
         assert {r['auth'] for r in legacy.requests} == {'Bearer sk-legacy-own'}
         assert 'sk-row-stored' not in str(policy) + str(runtime)
+
+
+def test_adopted_opencode_go_session_with_canonical_base_url_preserves_credential_pool(monkeypatch):
+    """A legacy session whose model_config or request_json carries the canonical
+    opencode-go endpoint (https://opencode.ai/zen/go/v1 or /zen/go) without an explicit API key must
+    resolve through the multi-key credential pool rather than falling into _resolve_explicit_runtime
+    with credential_pool=None, using only the first key."""
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    home = Path(os.environ["HERMES_HOME"])
+    monkeypatch.setattr("gateway.run._hermes_home", home)
+    for idx in range(2, 10):
+        monkeypatch.delenv(f"OPENCODE_GO_API_KEY_{idx}", raising=False)
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "ocgo-key1-valid-token-0000001")
+    monkeypatch.setenv("OPENCODE_GO_API_KEY_2", "ocgo-key2-valid-token-0000002")
+    monkeypatch.setenv("OPENCODE_GO_API_KEY_3", "ocgo-key3-valid-token-0000003")
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n  default: glm-5\n  provider: opencode-go\n"
+        "credential_pool:\n  strategy: round_robin\n"
+        "agent:\n  api_max_retries: 1\nplatform_toolsets:\n  gui: []\n"
+    )
+
+    for canonical_url in ("https://opencode.ai/zen/go/v1", "https://opencode.ai/zen/go"):
+        policy, (_model, runtime) = _adopt_and_resolve(
+            home,
+            {"provider": "opencode-go", "base_url": canonical_url},
+            source="desktop",
+        )
+        assert runtime["provider"] == "opencode-go"
+        assert runtime.get("credential_pool") is not None, (
+            f"Expected adopted opencode-go session ({canonical_url}) to keep credential_pool, "
+            f"got source={runtime.get('source')!r}"
+        )
+        assert len(runtime["credential_pool"].entries()) == 3
+
+        direct = resolve_runtime_provider(
+            requested="opencode-go",
+            explicit_base_url=canonical_url,
+            target_model="glm-5",
+        )
+        assert direct.get("credential_pool") is not None
+        assert len(direct["credential_pool"].entries()) == 3
+
+    explicit_key_with_canonical_url = resolve_runtime_provider(
+        requested="opencode-go",
+        explicit_api_key="ocgo-explicit-single-key-0001",
+        explicit_base_url="https://opencode.ai/zen/go/v1",
+        target_model="glm-5",
+    )
+    assert explicit_key_with_canonical_url.get("source") == "explicit"
+    assert explicit_key_with_canonical_url.get("credential_pool") is None
+
+    custom_override = resolve_runtime_provider(
+        requested="opencode-go",
+        explicit_base_url="https://my-opencode-proxy.example.com/v1",
+        target_model="glm-5",
+    )
+    assert custom_override.get("source") == "explicit"
+    assert custom_override.get("credential_pool") is None
+
+    from gateway.session_worker_construct import worker_route
+    wroute = worker_route(policy, {"api_key": None})
+    assert wroute.get("credential_pool") is not None
+    assert len(wroute["credential_pool"].entries()) == 3
+
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    from run_agent import AIAgent
+    with FakeLLMServer([Text("pooled turn ok")]) as pooled_srv:
+        monkeypatch.setattr(PROVIDER_REGISTRY["opencode-go"], "inference_base_url", pooled_srv.base_url)
+        rt_live = resolve_runtime_provider(
+            requested="opencode-go",
+            explicit_base_url=pooled_srv.base_url,
+            target_model="glm-5",
+        )
+        assert rt_live.get("credential_pool") is not None
+        agent = AIAgent(
+            model="glm-5",
+            api_key=rt_live["api_key"],
+            base_url=rt_live["base_url"],
+            provider="opencode-go",
+            api_mode="chat_completions",
+            credential_pool=rt_live["credential_pool"],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=["memory"],
+        )
+        turn_res = agent.run_conversation("verify pooled conversation replay")
+        assert turn_res["final_response"] == "pooled turn ok"
+        assert getattr(agent, "_credential_pool", None) is not None
+        assert len(pooled_srv.main_requests()) == 1

@@ -158,16 +158,19 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
     control asking which route the session itself runs). The one resolver an in-process turn
     (``_resolve_policy_agent_runtime``) and a managed worker (``worker_route``) share."""
     from hermes_cli.runtime_provider import (
-        frozen_runtime_config, resolve_runtime_provider, resolve_runtime_with_fallback,
+        frozen_runtime_config, is_canonical_provider_base_url,
+        resolve_runtime_provider, resolve_runtime_with_fallback,
     )
     from hermes_cli.runtime_provider_custom import _resolve_named_custom_runtime
-    provider = (frozen.get('model') or {}).get('provider')
+    model_cfg = frozen.get('model') or {}
+    provider = model_cfg.get('provider')
     launch_url = json.loads(policy.request_json).get('base_url')
     if launch_url:
         # The creation request is immutable identity, not the current selection: once a canonical
         # model mutation moved the route off the launch endpoint, the policy's selection wins.
         from hermes_cli.route_identity import normalize_route_base_url
-        if normalize_route_base_url(launch_url) != normalize_route_base_url((frozen.get('model') or {}).get('base_url')):
+        if (normalize_route_base_url(launch_url) != normalize_route_base_url(model_cfg.get('base_url'))
+                or (not key and is_canonical_provider_base_url(provider, launch_url, model_cfg))):
             launch_url = None
     # Every rung reads the session's FROZEN config, never live config.yaml: a later
     # ``model.base_url`` edit must not carry this route's frozen credential to the new host
@@ -220,8 +223,11 @@ def worker_route(policy, construct):
     if (api_mode == 'chat_completions' and runtime.get('provider') != 'custom'
             and not (frozen.get('model') or {}).get('api_mode')):
         api_mode = None
-    return {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
-            'api_mode': api_mode}
+    out = {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
+           'api_mode': api_mode}
+    if not construct.get('api_key') and runtime.get('credential_pool') is not None:
+        out['credential_pool'] = runtime.get('credential_pool')
+    return out
 
 
 def checkpoint_agent_kwargs(config):

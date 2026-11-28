@@ -914,12 +914,80 @@ _EXPLICIT_RESOLVERS: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 
+def is_canonical_provider_base_url(
+    provider: Optional[str],
+    base_url: Optional[str],
+    model_cfg: Optional[dict[str, Any]] = None,
+) -> bool:
+    """True when ``base_url`` is ``provider``'s own stock default endpoint (and does not override a
+    different configured ``model.base_url`` or provider ``*_BASE_URL`` env override back to stock).
+
+    Adopted unified-gateway sessions record the resolved runtime URL in ``model_config`` /
+    ``request_json['base_url']`` (e.g. ``https://opencode.ai/zen/go/v1`` for ``opencode-go``).
+    Treating that stock URL as an explicit ``--base-url`` override when no ``explicit_api_key`` was
+    supplied intercepts at ``_resolve_explicit_runtime`` before ``_resolve_from_pool`` and drops the
+    provider's multi-key credential pool.
+    """
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    prov = str(provider or "").strip().lower()
+    url = normalize_route_base_url(str(base_url or "").strip())
+    if not prov or not url:
+        return False
+    canonical: set[str] = set()
+    pconfig = PROVIDER_REGISTRY.get(prov)
+    if pconfig and pconfig.inference_base_url:
+        canonical.add(normalize_route_base_url(pconfig.inference_base_url))
+        if _models.opencode_provider_family(prov) is not None:
+            for mode in ("chat_completions", "anthropic_messages"):
+                canonical.add(
+                    normalize_route_base_url(
+                        _models.normalize_opencode_base_url(prov, mode, pconfig.inference_base_url)
+                    )
+                )
+    if prov == "anthropic":
+        canonical.add(normalize_route_base_url(_ANTHROPIC_DEFAULT_BASE_URL))
+        canonical.add(normalize_route_base_url(f"{_ANTHROPIC_DEFAULT_BASE_URL}/v1"))
+    elif prov == "openai-codex":
+        canonical.add(normalize_route_base_url(DEFAULT_CODEX_BASE_URL))
+    elif prov == "nous":
+        canonical.add(normalize_route_base_url(auth_mod.DEFAULT_NOUS_INFERENCE_URL))
+    elif prov == "xai-oauth":
+        canonical.add(normalize_route_base_url(DEFAULT_XAI_OAUTH_BASE_URL))
+    elif prov == "qwen-oauth":
+        canonical.add(normalize_route_base_url(DEFAULT_QWEN_BASE_URL))
+    elif prov == "openrouter":
+        canonical.add(normalize_route_base_url(OPENROUTER_BASE_URL))
+    canonical.discard("")
+    if url not in canonical:
+        return False
+    if isinstance(model_cfg, dict):
+        cfg_url = normalize_route_base_url(_config_base_url_for_provider(model_cfg, prov))
+        if cfg_url and cfg_url not in canonical:
+            return False
+    if pconfig and pconfig.base_url_env_var:
+        env_url = normalize_route_base_url(get_secret_str(pconfig.base_url_env_var, "").strip())
+        if env_url and env_url not in canonical:
+            return False
+    if prov == "openai-codex":
+        env_url = normalize_route_base_url(get_secret_str("HERMES_CODEX_BASE_URL", "").strip())
+        if env_url and env_url not in canonical:
+            return False
+    if prov == "nous":
+        env_url = normalize_route_base_url(_nous_inference_env_override() or "")
+        if env_url and env_url not in canonical:
+            return False
+    return True
+
+
 def _resolve_explicit_runtime(*, provider: str, requested_provider: str, model_cfg: dict[str, Any],
                               explicit_api_key: Optional[str] = None, explicit_base_url: Optional[str] = None,
                               target_model: Optional[str] = None) -> Optional[dict[str, Any]]:
     explicit_api_key = str(explicit_api_key or "").strip()
     explicit_base_url = str(explicit_base_url or "").strip().rstrip("/")
-    if not explicit_api_key and not explicit_base_url:
+    if not explicit_api_key and (
+        not explicit_base_url or is_canonical_provider_base_url(provider, explicit_base_url, model_cfg)
+    ):
         return None
     resolver = _EXPLICIT_RESOLVERS.get(provider)
     if resolver is not None:
