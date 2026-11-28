@@ -49,7 +49,7 @@ def _classify_go_error(error, *, status_code, message, **_):
     "Upstream request failed" is one model's upstream throttle: the key still serves every other
     model, so benching it for the 429 hour starves the rest of the pool (aux tasks on another
     model then see "no available entries")."""
-    if status_code == 429 and "upstream request failed" in message:
+    if status_code == 429 and "upstream request failed" in str(message or "").lower():
         return {"reason": "upstream_rate_limit", "should_fallback": True}
     return None
 
@@ -79,7 +79,9 @@ class OpenCodeGoProfile(ProviderProfile):
         from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        runtime = resolve_runtime_provider(requested=self.name, explicit_base_url=base_url, explicit_api_key=api_key)
+        runtime = resolve_runtime_provider(
+            requested=self.name, explicit_base_url=base_url, explicit_api_key=api_key, read_only=True
+        )
         token = str(runtime.get("api_key", "") or "").strip()
         if not token:
             return None

@@ -47,7 +47,11 @@ def record_plan_window(context: dict[str, Any], headers: Any) -> None:
 
 def account_window_spent(error_context: Optional[dict[str, Any]]) -> bool:
     """The 429 names a spent account-wide plan window: no model on the credential is served."""
-    return str((error_context or {}).get("subscription_window") or "") in ACCOUNT_WIDE_PLAN_WINDOWS
+    ctx = error_context or {}
+    if str(ctx.get("subscription_window") or "") in ACCOUNT_WIDE_PLAN_WINDOWS:
+        return True
+    reason = str(ctx.get("reason") or "").lower()
+    return "gousagelimit" in reason
 
 
 def usage_allowance_spent(error_context: Optional[dict[str, Any]]) -> bool:

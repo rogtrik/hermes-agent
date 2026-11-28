@@ -798,7 +798,7 @@ class PoolChoice:
 
 
 def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: dict[str, Any], explicit_api_key, explicit_base_url,
-                       target_model) -> Optional[dict[str, Any]]:
+                       target_model, *, read_only: bool = False) -> Optional[dict[str, Any]]:
     """Runtime from the provider's credential pool, or None to continue down the ladder."""
     # A Foundry endpoint rejects Claude Code OAuth tokens, and pairing an OAuth row with a
     # config-stored Foundry model.base_url presents the subscription token to a non-Anthropic host:
@@ -813,7 +813,7 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: dict[s
         pool = None
     if base_url_host_matches(cfg_url, "azure.com"):
         pool = anthropic_foundry_pool(pool, cfg_url)
-    picked = choose_pool_key(pool, provider, model=target_model)
+    picked = choose_pool_key(pool, provider, model=target_model, mode="peek" if read_only else "select")
     if picked is None:
         return None
     pool, entry = picked.pool, picked.entry
@@ -1232,7 +1232,8 @@ def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url
 
 
 def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
-                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> dict[str, Any]:
+                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None,
+                             read_only: bool = False) -> dict[str, Any]:
     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
     rung returns or raises, else falls to the next):
       1. disabled-provider guard (``providers.<name>.enabled: false``)
@@ -1260,7 +1261,12 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     requested_alias = requested_provider
     requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
-    runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
+    runtime = next(
+        r for r in _ladder_rungs(
+            requested_provider, explicit_api_key, explicit_base_url, target_model, read_only=read_only
+        )
+        if r
+    )
     _raise_for_credentialless_bare_custom(requested_provider, runtime)
     # model.openai_runtime is applied ONCE, after the ladder: every rung (pool, OAuth store,
     # explicit --api-key/--base-url, env key) hardcodes the wire api_mode for openai/openai-codex,
@@ -1298,7 +1304,7 @@ def _raise_for_credentialless_bare_custom(requested_provider: str, runtime: dict
     )
 
 
-def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model):
+def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model, *, read_only: bool = False):
     """Ladder rungs 2-8, yielded lazily so each is evaluated only when the previous one returned
     nothing; the last rung (OpenRouter / bare-custom fallback) always yields a runtime."""
     yield _resolve_requested_shortcuts(requested_provider, explicit_api_key, explicit_base_url, target_model)
@@ -1314,7 +1320,9 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
                                     explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
                                     target_model=target_model)
-    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
+    yield _resolve_from_pool(
+        provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model, read_only=read_only
+    )
     swallowed_auth_error = None
     if provider in _OAUTH_RUNTIME_PROVIDERS:
         try:

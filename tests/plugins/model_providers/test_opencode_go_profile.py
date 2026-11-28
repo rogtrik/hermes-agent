@@ -300,7 +300,7 @@ def test_opencode_go_plan_windows_reach_usage_through_profile_hook(opencode_go_p
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
         # /v1 stripped, as anthropic_messages routing leaves it — the hook must not reuse this base_url.
-        lambda requested, explicit_base_url=None, explicit_api_key=None: {
+        lambda requested, explicit_base_url=None, explicit_api_key=None, read_only=False: {
             "provider": "opencode-go", "base_url": "https://opencode.ai/zen/go", "api_key": "sk-test"},
     )
 
@@ -310,3 +310,86 @@ def test_opencode_go_plan_windows_reach_usage_through_profile_hook(opencode_go_p
     assert [(w.label, w.used_percent) for w in snapshot.windows] == [
         ("Rolling window", 3.0), ("Weekly", 2.0), ("Monthly", 2.0)]
     assert snapshot.windows[0].reset_at == datetime(2026, 9, 16, 21, 44, 55, 176000, tzinfo=UTC)
+
+
+def test_opencode_go_usage_probe_passes_read_only_and_classifies_error_case_insensitively(tmp_path, monkeypatch):
+    from agent.account_usage import fetch_account_usage
+    from agent.agent_runtime_helpers import extract_api_error_context
+    from agent.credential_pool import load_pool
+    from agent.credential_pool_model_cooldowns import account_window_spent
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("opencode-go")
+    assert profile is not None and profile.classify_api_error is not None
+    assert profile.classify_api_error(
+        Exception("Upstream Request Failed"), status_code=429, message="Upstream Request Failed"
+    ) == {"reason": "upstream_rate_limit", "should_fallback": True}
+
+    home = tmp_path / "hermes-home"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "model:\n  default: glm-5\n  provider: opencode-go\n"
+        "credential_pool:\n  strategy: round_robin\n",
+        encoding="utf-8",
+    )
+    for idx in range(2, 26):
+        monkeypatch.delenv(f"OPENCODE_GO_API_KEY_{idx}", raising=False)
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "ocgo-key1-token-0000001")
+    monkeypatch.setenv("OPENCODE_GO_API_KEY_2", "ocgo-key2-token-0000002")
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"usage": {"rolling": {"status": "ok", "percent": 5, "resetsAt": "2026-09-16T21:44:55.176Z"}}}
+
+    class _Client:
+        def __init__(self, timeout=None):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, headers=None):
+            return _Response()
+
+    monkeypatch.setattr("httpx.Client", _Client)
+
+    # 1. Real resolve_runtime_provider(read_only=True) peeks without rotating round_robin pool order
+    order_before = [e.id for e in load_pool("opencode-go").entries()]
+    snap1 = fetch_account_usage("opencode-go")
+    snap2 = fetch_account_usage("opencode-go")
+    assert snap1 is not None and snap2 is not None
+    order_after = [e.id for e in load_pool("opencode-go").entries()]
+    assert order_after == order_before
+
+    # 2. Real GoUsageLimitError 429 body extracted via extract_api_error_context benches the whole account
+    # across all models, whereas mark_exhausted_and_rotate forwards model= to skip a model-cooled sibling
+    class _Fake429(Exception):
+        def __init__(self):
+            super().__init__('Error code: 429 - {"error": {"type": "GoUsageLimitError", "message": "Usage limit reached"}}')
+            self.body = {"error": {"type": "GoUsageLimitError", "message": "Usage limit reached"}}
+
+    ctx = extract_api_error_context(_Fake429())
+    assert account_window_spent(ctx) is True
+
+    pool = load_pool("opencode-go")
+    e1, e2 = pool.entries()[0], pool.entries()[1]
+    pool._cool_down_model(e2, "glm-5", {"message": "Upstream Request Failed"}, failure_reason="rate_limit")
+    rotated_same_model = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context=ctx,
+        api_key_hint="ocgo-key1-token-0000001",
+        credential_id=e1.id,
+        failure_reason="rate_limit",
+        model="glm-5",
+    )
+    assert rotated_same_model is None
+    # Key 1 is benched account-wide (even for kimi-k2.5), while Key 2 is only cooled for glm-5 and serves kimi-k2.5
+    picked_sibling_model = pool.select(model="kimi-k2.5")
+    assert picked_sibling_model is not None and picked_sibling_model.id == e2.id
